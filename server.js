@@ -4,6 +4,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('ssh2');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -16,17 +17,10 @@ app.use(express.json());
 ------------------------------------------------------------------ */
 const keyPath = path.resolve(__dirname, process.env.EC2_KEY_PATH || 'mediamtx-key.pem');
 
-// Only write the key file if it doesn't already exist
 if (!fs.existsSync(keyPath)) {
   console.log("🔐 Writing EC2 private key from environment variable...");
-
-  if (!process.env.EC2_KEY) {
-    console.log("❌ EC2_KEY environment variable is missing");
-  } else {
-    fs.writeFileSync(keyPath, process.env.EC2_KEY, {
-      mode: 0o600, // Secure file permissions
-    });
-    console.log("✅ EC2 private key written to:", keyPath);
+  if (process.env.EC2_KEY) {
+    fs.writeFileSync(keyPath, process.env.EC2_KEY, { mode: 0o600 });
   }
 }
 
@@ -35,17 +29,8 @@ if (!fs.existsSync(keyPath)) {
 ------------------------------------------------------------------ */
 const connectToEC2 = () => {
   return new Promise((resolve, reject) => {
-    // Validate required environment variables
-    if (!process.env.EC2_HOST) {
-      reject(new Error("Missing required environment variable: EC2_HOST"));
-      return;
-    }
-    if (!process.env.EC2_USER) {
-      reject(new Error("Missing required environment variable: EC2_USER"));
-      return;
-    }
-    if (!fs.existsSync(keyPath)) {
-      reject(new Error(`EC2 private key file not found at: ${keyPath}`));
+    if (!process.env.EC2_HOST || !process.env.EC2_USER || !fs.existsSync(keyPath)) {
+      reject(new Error("Missing required environment variables or key file"));
       return;
     }
 
@@ -57,10 +42,7 @@ const connectToEC2 = () => {
         console.log("✅ SSH CONNECTION ESTABLISHED with EC2");
         resolve(conn);
       })
-      .on('error', (err) => {
-        console.log("❌ SSH CONNECTION FAILED:", err.message);
-        reject(err);
-      })
+      .on('error', reject)
       .connect({
         host: process.env.EC2_HOST,
         username: process.env.EC2_USER,
@@ -70,19 +52,80 @@ const connectToEC2 = () => {
 };
 
 /* ------------------------------------------------------------------
-   START MEDIAMTX ON EC2 (DETACHED, PERSISTENT)
+   COMPLETE HLS PROXY SOLUTION
+------------------------------------------------------------------ */
+
+// Proxy for m3u8 playlists - rewrite URLs to use our proxy
+app.get('/proxy/stream/:streamId', async (req, res) => {
+  const { streamId } = req.params;
+  const targetUrl = `http://3.16.91.248:8888/${streamId}/index.m3u8`;
+  
+  console.log(`🔁 Proxying playlist: ${streamId}`);
+  
+  try {
+    const playlist = await fetchPlaylist(targetUrl);
+    
+    // Rewrite all URLs in the playlist to use our proxy
+    const rewrittenPlaylist = playlist.replace(
+      /(\w+\.(m3u8|ts))/g, 
+      `/proxy/segment/${streamId}/$1`
+    );
+    
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(rewrittenPlaylist);
+  } catch (error) {
+    console.log(`❌ Playlist proxy error:`, error.message);
+    res.status(500).json({ error: 'Failed to proxy playlist' });
+  }
+});
+
+// Proxy for segments (.ts files and nested .m3u8 files)
+app.get('/proxy/segment/:streamId/:filename', (req, res) => {
+  const { streamId, filename } = req.params;
+  const targetUrl = `http://3.16.91.248:8888/${streamId}/${filename}`;
+  
+  console.log(`🔁 Proxying segment: ${streamId}/${filename}`);
+  
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache');
+  
+  // Set appropriate content type
+  if (filename.endsWith('.m3u8')) {
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  } else if (filename.endsWith('.ts')) {
+    res.setHeader('Content-Type', 'video/MP2T');
+  }
+  
+  http.get(targetUrl, (proxyRes) => {
+    res.status(proxyRes.statusCode);
+    proxyRes.pipe(res);
+  }).on('error', (err) => {
+    console.log(`❌ Segment proxy error:`, err.message);
+    res.status(500).json({ error: 'Proxy error' });
+  });
+});
+
+// Helper function to fetch playlist
+function fetchPlaylist(url) {
+  return new Promise((resolve, reject) => {
+    http.get(url, (response) => {
+      let data = '';
+      response.on('data', (chunk) => data += chunk);
+      response.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+}
+
+/* ------------------------------------------------------------------
+   START MEDIAMTX ON EC2
 ------------------------------------------------------------------ */
 app.post('/start-mt', async (req, res) => {
   try {
     const conn = await connectToEC2();
-
-    // Use the HLS_COMMAND from environment or fallback to default
-    const startCommand = process.env.HLS_COMMAND || `
-      nohup setsid /usr/local/bin/mediamtx /home/ec2-user/mediamtx.yml > /home/ec2-user/mediamtx.log 2>&1 < /dev/null &
-    `;
+    const startCommand = process.env.HLS_COMMAND;
 
     console.log("🚀 Starting MediaMTX on EC2...");
-    console.log("📝 Command:", startCommand);
 
     conn.exec(startCommand, (err, stream) => {
       if (err) {
@@ -90,71 +133,46 @@ app.post('/start-mt', async (req, res) => {
         return res.status(500).json({ error: err.message });
       }
 
-      let output = '';
-
-      stream
-        .on('data', (data) => {
-          output += data.toString();
-          console.log('SSH Output:', data.toString());
-        })
-        .stderr.on('data', (data) => {
-          console.log('SSH Error:', data.toString());
-        })
-        .on('close', (code, signal) => {
-          conn.end();
-          console.log("✅ MediaMTX startup command completed");
-
-          res.json({
-            message: "MediaMTX started successfully",
-            streams: [
-              "http://3.16.91.248:8888/stream1/index.m3u8",
-              "http://3.16.91.248:8888/stream2/index.m3u8",
-              "http://3.16.91.248:8888/stream3/index.m3u8",
-              "http://3.16.91.248:8888/stream4/index.m3u8",
-              "http://3.16.91.248:8888/stream5/index.m3u8"
-            ]
-          });
+      stream.on('close', () => {
+        conn.end();
+        console.log("✅ MediaMTX startup completed");
+        
+        const baseUrl = `https://videostreamingapp-18pd.onrender.com`;
+        res.json({
+          message: "MediaMTX started successfully",
+          streams: [
+            `${baseUrl}/proxy/stream/stream1`,
+            `${baseUrl}/proxy/stream/stream2`, 
+            `${baseUrl}/proxy/stream/stream3`,
+            `${baseUrl}/proxy/stream/stream4`,
+            `${baseUrl}/proxy/stream/stream5`
+          ]
         });
+      });
     });
   } catch (err) {
     console.log("❌ ERROR:", err.message);
-    res.status(500).json({ 
-      error: err.message,
-      details: "Check if EC2_HOST, EC2_USER, and EC2_KEY environment variables are properly set"
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
 /* ------------------------------------------------------------------
-   HEALTH CHECK ENDPOINT
+   HEALTH CHECK & DEFAULT ROUTES
 ------------------------------------------------------------------ */
 app.get('/health', (req, res) => {
-  const envVars = {
-    EC2_HOST: process.env.EC2_HOST ? 'Set' : 'Missing',
-    EC2_USER: process.env.EC2_USER ? 'Set' : 'Missing', 
-    EC2_KEY: process.env.EC2_KEY ? 'Set' : 'Missing',
-    EC2_KEY_PATH: process.env.EC2_KEY_PATH ? 'Set' : 'Missing',
-    HLS_COMMAND: process.env.HLS_COMMAND ? 'Set' : 'Using default',
-    PORT: process.env.PORT || 5000,
-    keyFileExists: fs.existsSync(keyPath) ? 'Exists' : 'Missing',
-    keyPath: keyPath
-  };
-
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    environment: envVars
+    proxy: 'HLS proxy is running'
   });
 });
 
-/* ------------------------------------------------------------------
-   DEFAULT ROUTE
------------------------------------------------------------------- */
 app.get('/', (req, res) => {
   res.json({ 
-    message: "Express API is running!",
+    message: "Express API with HLS Proxy is running!",
     endpoints: {
       startMediaMTX: 'POST /start-mt',
+      proxyStream: 'GET /proxy/stream/:streamId',
       health: 'GET /health'
     }
   });
@@ -162,4 +180,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT}`);
+  console.log(`🔒 HLS Proxy available at: https://videostreamingapp-18pd.onrender.com`);
 });
