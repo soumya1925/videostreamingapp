@@ -75,14 +75,15 @@ app.post('/start-mt', async (req, res) => {
 
       console.log("✅ MediaMTX started in background.");
 
+      // Return HTTPS URLs instead of HTTP
       res.json({
         message: "MediaMTX started successfully",
         streams: [
-          "http://3.16.91.248:8888/stream1/index.m3u8",
-          "http://3.16.91.248:8888/stream2/index.m3u8",
-          "http://3.16.91.248:8888/stream3/index.m3u8",
-          "http://3.16.91.248:8888/stream4/index.m3u8",
-          "http://3.16.91.248:8888/stream5/index.m3u8"
+          "https://3.16.91.248:8888/stream1/index.m3u8",
+          "https://3.16.91.248:8888/stream2/index.m3u8",
+          "https://3.16.91.248:8888/stream3/index.m3u8",
+          "https://3.16.91.248:8888/stream4/index.m3u8",
+          "https://3.16.91.248:8888/stream5/index.m3u8"
         ]
       });
     });
